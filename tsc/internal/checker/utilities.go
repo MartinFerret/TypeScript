@@ -661,6 +661,11 @@ func CompareTypes(t1, t2 *Type) int {
 					return c
 				}
 			}
+			// Instantiations are ordered by the types they instantiate, then by
+			// their mappers.
+			if c := CompareTypes(t1.AsObjectType().target, t2.AsObjectType().target); c != 0 {
+				return c
+			}
 			m1 := t1.AsObjectType().mapper
 			m2 := t2.AsObjectType().mapper
 			if t1.objectFlags&ObjectFlagsMapped != 0 {

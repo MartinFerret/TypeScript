@@ -394,7 +394,8 @@ func (c *Checker) compareSymbolsWorker(s1, s2 *ast.Symbol) int {
 }
 
 // compareSymbolOrigins orders transient symbols by the symbols and types they
-// are made from, which are recorded when they are created: the properties a
+// are made from, which are recorded when they are created: the binding element
+// declaring a member of a type implied by a binding pattern, the properties a
 // spread merges or copies, the mapped, union, or intersection type containing
 // a synthesized property and its key type, and the symbol an instantiated or
 // copied symbol is made from along with its mapper.
@@ -406,6 +407,9 @@ func (c *Checker) compareSymbolOrigins(s1, s2 *ast.Symbol) int {
 	// name differ in the unresolved names that qualify them.
 	if s1.CheckFlags()&s2.CheckFlags()&ast.CheckFlagsUnresolved != 0 {
 		return c.compareSymbols(s1.Parent(), s2.Parent())
+	}
+	if r := c.compareNodes(c.bindingElementOfMember[s1], c.bindingElementOfMember[s2]); r != 0 {
+		return r
 	}
 	spread1 := c.spreadLinks.TryGet(s1)
 	spread2 := c.spreadLinks.TryGet(s2)
@@ -688,6 +692,10 @@ func CompareTypes(t1, t2 *Type) int {
 				// Fresh, regular, and widened copies of the same literal differ only in
 				// the flags set when they were created.
 				if c := int(t1.objectFlags&objectLiteralCreationFlags) - int(t2.objectFlags&objectLiteralCreationFlags); c != 0 {
+					return c
+				}
+				// Types implied by different binding patterns differ only in their patterns.
+				if c := t1.checker.compareNodes(t1.checker.patternForType[t1], t2.checker.patternForType[t2]); c != 0 {
 					return c
 				}
 				if c := compareObjectMemberSymbols(t1, t2); c != 0 {

@@ -29085,23 +29085,50 @@ const (
 	baseConstraintMaxNesting = 5
 )
 
-// countBaseConstraintRepeats returns how many of the recursion identities on a
-// walk's stack are identity.
-func countBaseConstraintRepeats(identity RecursionId, stack []RecursionId) int {
+// A baseConstraintFrame is a type whose base constraint a walk is computing:
+// its recursion identity and generation.
+type baseConstraintFrame struct {
+	identity   RecursionId
+	generation int
+}
+
+// countBaseConstraintRepeats returns how many of frames a type with identity
+// and generation repeats, as repeatsInBaseConstraintWalk decides, and the
+// highest generation among them, or generation if none.
+func countBaseConstraintRepeats(identity RecursionId, generation int, frames []baseConstraintFrame) (int, int) {
 	count := 0
-	for _, id := range stack {
-		if id == identity {
+	highest := generation
+	for _, f := range frames {
+		if f.identity == identity && generation >= f.generation {
+			if count == 0 || f.generation > highest {
+				highest = f.generation
+			}
 			count++
 		}
 	}
-	return count
+	return count, highest
+}
+
+// repeatsInBaseConstraintWalk reports whether the walk with stack, computing
+// the base constraint of a type with identity and generation, is in a
+// repeating pattern: whether a type with the same recursion identity is
+// already on the stack, and the type is no older than it. A newer type may be
+// instantiated from it without end, whereas an older one is a part of it,
+// such as the object type of an indexed access, of which there are only as
+// many as the type has.
+func repeatsInBaseConstraintWalk(identity RecursionId, generation int, stack []baseConstraintFrame) bool {
+	count, _ := countBaseConstraintRepeats(identity, generation, stack)
+	return count != 0
 }
 
 // A baseConstraintRepeat summarizes the frames with one recursion identity
-// along the paths of a walk: the most on any path.
+// along the paths of a walk: the most on any path, and the highest generation
+// of a frame a type on the stack the walk is entered with must not be newer
+// than to repeat them.
 type baseConstraintRepeat struct {
-	identity RecursionId
-	count    int
+	identity   RecursionId
+	generation int
+	count      int
 }
 
 type baseConstraintWalk struct {
@@ -29113,7 +29140,7 @@ type baseConstraintWalk struct {
 
 // addBaseConstraintRepeat records count frames with identity in the walk
 // being computed. Its repeats are the end of the buffer, from repeatsStart.
-func (c *Checker) addBaseConstraintRepeat(identity RecursionId, count int) {
+func (c *Checker) addBaseConstraintRepeat(identity RecursionId, generation int, count int) {
 	if _, ok := identity.value.(*Type); ok {
 		// A type that is its own recursion identity repeats only where a walk
 		// re-enters it, which reusing a kept base constraint never accounts
@@ -29123,11 +29150,12 @@ func (c *Checker) addBaseConstraintRepeat(identity RecursionId, count int) {
 	repeats := c.baseConstraintRepeatBuffer[c.baseConstraintWalk.repeatsStart:]
 	for i := range repeats {
 		if r := &repeats[i]; r.identity == identity {
+			r.generation = max(r.generation, generation)
 			r.count = max(r.count, count)
 			return
 		}
 	}
-	c.baseConstraintRepeatBuffer = append(c.baseConstraintRepeatBuffer, baseConstraintRepeat{identity: identity, count: count})
+	c.baseConstraintRepeatBuffer = append(c.baseConstraintRepeatBuffer, baseConstraintRepeat{identity: identity, generation: generation, count: count})
 }
 
 // addInnerBaseConstraintWalk records in the walk being computed a walk
@@ -29136,24 +29164,26 @@ func (c *Checker) addBaseConstraintRepeat(identity RecursionId, count int) {
 // walk's own repeats end at end in the buffer; when repeats are those of an
 // inner walk just computed, which follow, each is read before the walk's own
 // are written over it.
-func (c *Checker) addInnerBaseConstraintWalk(height int32, repeats []baseConstraintRepeat, gaveUp bool, stack []RecursionId, end int) {
+func (c *Checker) addInnerBaseConstraintWalk(height int32, repeats []baseConstraintRepeat, gaveUp bool, stack []baseConstraintFrame, end int) {
 	w := &c.baseConstraintWalk
 	w.depth = max(w.depth, int32(len(stack))+height)
 	w.gaveUp = w.gaveUp || gaveUp
 	frames := stack[w.start:]
 	buffer := c.baseConstraintRepeatBuffer[:end]
 	for _, r := range repeats {
-		count := countBaseConstraintRepeats(r.identity, frames) + r.count
+		count, generation := countBaseConstraintRepeats(r.identity, r.generation, frames)
+		count += r.count
 		found := false
 		for i := w.repeatsStart; i < len(buffer); i++ {
 			if own := &buffer[i]; own.identity == r.identity {
+				own.generation = max(own.generation, generation)
 				own.count = max(own.count, count)
 				found = true
 				break
 			}
 		}
 		if !found {
-			buffer = append(buffer, baseConstraintRepeat{identity: r.identity, count: count})
+			buffer = append(buffer, baseConstraintRepeat{identity: r.identity, generation: generation, count: count})
 		}
 	}
 	c.baseConstraintRepeatBuffer = buffer
@@ -29161,7 +29191,7 @@ func (c *Checker) addInnerBaseConstraintWalk(height int32, repeats []baseConstra
 
 // canReuseBaseConstraint reports whether computing the kept base constraint of
 // t inside the walk with stack would give up nowhere.
-func (c *Checker) canReuseBaseConstraint(t *Type, stack []RecursionId) bool {
+func (c *Checker) canReuseBaseConstraint(t *Type, stack []baseConstraintFrame) bool {
 	depth := len(stack) + int(t.baseConstraintHeight)
 	if depth < baseConstraintFreeDepth {
 		return true
@@ -29170,14 +29200,15 @@ func (c *Checker) canReuseBaseConstraint(t *Type, stack []RecursionId) bool {
 		return false
 	}
 	for _, r := range c.baseConstraintRepeats[t] {
-		if countBaseConstraintRepeats(r.identity, stack)+r.count > 1 {
+		count, _ := countBaseConstraintRepeats(r.identity, r.generation, stack)
+		if count+r.count > 1 {
 			return false
 		}
 	}
 	return true
 }
 
-func (c *Checker) getResolvedBaseConstraint(t *Type, stack []RecursionId) *Type {
+func (c *Checker) getResolvedBaseConstraint(t *Type, stack []baseConstraintFrame) *Type {
 	constrained := t.AsConstrainedType()
 	if constrained == nil {
 		return t
@@ -29223,9 +29254,9 @@ func (c *Checker) getResolvedBaseConstraint(t *Type, stack []RecursionId) *Type 
 
 // resolveBaseConstraint computes the base constraint of t inside the walk
 // with stack as the resolution of propertyName, and returns it with the depth
-// its own walk reached, the repeats of its walk if they are to be kept, and
-// whether its own walk gave up.
-func (c *Checker) resolveBaseConstraint(t *Type, stack []RecursionId, propertyName TypeSystemPropertyName) (*Type, int32, []baseConstraintRepeat, bool) {
+// its own walk reached, the repeats of its walk, and whether its own walk gave
+// up.
+func (c *Checker) resolveBaseConstraint(t *Type, stack []baseConstraintFrame, propertyName TypeSystemPropertyName) (*Type, int32, []baseConstraintRepeat, bool) {
 	if !c.pushTypeResolution(t, propertyName) {
 		return c.circularConstraintType, 0, nil, false
 	}
@@ -29256,7 +29287,7 @@ func (c *Checker) isBaseConstraintInProgress(t *Type) bool {
 // stack, and returns it with the depth its own walk reached, the repeats of
 // its walk if they are to be kept and it did not give up, and whether its own
 // walk gave up.
-func (c *Checker) walkBaseConstraint(t *Type, stack []RecursionId, keep bool) (*Type, int32, []baseConstraintRepeat, bool) {
+func (c *Checker) walkBaseConstraint(t *Type, stack []baseConstraintFrame, keep bool) (*Type, int32, []baseConstraintRepeat, bool) {
 	saveWalk := c.baseConstraintWalk
 	repeatsStart := len(c.baseConstraintRepeatBuffer)
 	c.baseConstraintWalk = baseConstraintWalk{depth: int32(len(stack)), start: len(stack), repeatsStart: repeatsStart}
@@ -29268,9 +29299,10 @@ func (c *Checker) walkBaseConstraint(t *Type, stack []RecursionId, keep bool) (*
 	// yet triggered the deeply nested limiter. We have no test cases that actually get to 50 levels of
 	// nesting, so it is effectively just a safety stop.
 	identity := getRecursionIdentity(t)
-	if len(stack) < baseConstraintFreeDepth || len(stack) < baseConstraintMaxDepth && !slices.Contains(stack, identity) {
-		c.addBaseConstraintRepeat(identity, 1)
-		constraint = c.computeBaseConstraint(c.getSimplifiedType(t /*writing*/, false), append(stack, identity))
+	generation := c.typeGeneration(t)
+	if len(stack) < baseConstraintFreeDepth || len(stack) < baseConstraintMaxDepth && !repeatsInBaseConstraintWalk(identity, generation, stack) {
+		c.addBaseConstraintRepeat(identity, generation, 1)
+		constraint = c.computeBaseConstraint(c.getSimplifiedType(t /*writing*/, false), append(stack, baseConstraintFrame{identity, generation}))
 	} else {
 		c.baseConstraintWalk.gaveUp = true
 	}
@@ -29361,7 +29393,7 @@ func (c *Checker) setTypeNesting(t *Type, own int, most int) (int, int) {
 	return own, most
 }
 
-func (c *Checker) computeBaseConstraint(t *Type, stack []RecursionId) *Type {
+func (c *Checker) computeBaseConstraint(t *Type, stack []baseConstraintFrame) *Type {
 	switch {
 	case t.flags&TypeFlagsTypeParameter != 0:
 		constraint := c.getConstraintFromTypeParameter(t)
@@ -29464,7 +29496,7 @@ func (c *Checker) computeBaseConstraint(t *Type, stack []RecursionId) *Type {
 	return t
 }
 
-func (c *Checker) getNextBaseConstraint(t *Type, stack []RecursionId) *Type {
+func (c *Checker) getNextBaseConstraint(t *Type, stack []baseConstraintFrame) *Type {
 	if t == nil {
 		return nil
 	}

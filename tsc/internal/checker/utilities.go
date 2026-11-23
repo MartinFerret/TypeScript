@@ -408,7 +408,9 @@ func (c *Checker) compareSymbolOrigins(s1, s2 *ast.Symbol) int {
 	if s1.CheckFlags()&s2.CheckFlags()&ast.CheckFlagsUnresolved != 0 {
 		return c.compareSymbols(s1.Parent(), s2.Parent())
 	}
-	if r := c.compareNodes(c.bindingElementOfMember[s1], c.bindingElementOfMember[s2]); r != 0 {
+	e1, _ := c.bindingElementOfMember.get(s1)
+	e2, _ := c.bindingElementOfMember.get(s2)
+	if r := c.compareNodes(e1, e2); r != 0 {
 		return r
 	}
 	spread1 := c.spreadLinks.TryGet(s1)
@@ -620,7 +622,7 @@ func CompareTypes(t1, t2 *Type) int {
 			// Here we know we have references to instantiations of the same type because we have matching targets.
 			if r1.node == nil && r2.node == nil {
 				// Non-deferred type references with the same target are sorted by their type argument lists.
-				if c := compareTypeLists(t1.AsTypeReference().resolvedTypeArguments, t2.AsTypeReference().resolvedTypeArguments); c != 0 {
+				if c := compareTypeLists(r1.typeArgumentsOfCreation(), r2.typeArgumentsOfCreation()); c != 0 {
 					return c
 				}
 			} else {
@@ -695,7 +697,9 @@ func CompareTypes(t1, t2 *Type) int {
 					return c
 				}
 				// Types implied by different binding patterns differ only in their patterns.
-				if c := t1.checker.compareNodes(t1.checker.patternForType[t1], t2.checker.patternForType[t2]); c != 0 {
+				p1, _ := t1.checker.patternForType.get(t1)
+				p2, _ := t2.checker.patternForType.get(t2)
+				if c := t1.checker.compareNodes(p1, p2); c != 0 {
 					return c
 				}
 				if c := compareObjectMemberSymbols(t1, t2); c != 0 {
@@ -831,8 +835,8 @@ func CompareTypes(t1, t2 *Type) int {
 	}
 	// Types implied by binding patterns are ordered by their patterns.
 	if t1.flags&TypeFlagsObject != 0 {
-		p1 := t1.checker.patternForType[t1]
-		p2 := t2.checker.patternForType[t2]
+		p1, _ := t1.checker.patternForType.get(t1)
+		p2, _ := t2.checker.patternForType.get(t2)
 		if c := t1.checker.compareNodes(p1, p2); c != 0 {
 			return c
 		}
@@ -1023,7 +1027,7 @@ func membersInTableOrder(t *Type) (int, iter.Seq[*ast.Symbol]) {
 	if d.members != nil {
 		return d.members.Len(), d.members.Values()
 	}
-	properties := d.getProperties()
+	properties := d.getProperties(t.checker)
 	return len(properties), slices.Values(properties)
 }
 
@@ -1058,10 +1062,18 @@ func (c *Checker) compareIndexInfos(infos1, infos2 []*IndexInfo) int {
 }
 
 // The type of a member of an object literal type is set when the member is
-// created.
+// created, except for properties synthesized by a spread, whose types are
+// computed when requested and which are ordered by the properties they are
+// made from instead.
 func (c *Checker) peekTypeOfObjectLiteralMember(s *ast.Symbol) *Type {
+	if c.spreadLinks.Has(s) {
+		return nil
+	}
+	if mapped := c.mappedSymbolLinks.TryGet(s); mapped != nil && mapped.syntheticOrigin != nil {
+		return nil
+	}
 	if links := c.valueSymbolLinks.TryGet(s); links != nil {
-		return links.resolvedType
+		return links.typeOfCreation()
 	}
 	return nil
 }
@@ -1117,7 +1129,7 @@ func compareTypeParameterOrigins(t1, t2 *Type) int {
 		// Tuple this types have no symbol; their constraint is the tuple target,
 		// initialized at creation.
 		if t1.symbol == nil {
-			return CompareTypes(p1.constraint, p2.constraint)
+			return CompareTypes(p1.constraintOfCreation(), p2.constraintOfCreation())
 		}
 	case typeParameterOriginDistributed:
 		return CompareTypes(p1.distributedType, p2.distributedType)
